@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Discover local Codex rollouts and resume a selected user session."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Optional
+
+
+UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+CONTEXT_RE = re.compile(
+    r"<(environment_context|user_instructions|turn_aborted)>.*?</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
+HEADER = f"{'UPDATED':<16}  {'PROJECT':<20}  {'BRANCH':<16}  FIRST MESSAGE"
+
+
+@dataclass(frozen=True)
+class Session:
+    session_id: str
+    mtime: float
+    cwd: Optional[str]
+    branch: str
+    preview: str
+    rollout: Path
+    timestamp: Optional[str] = None
+
+    @property
+    def project(self) -> str:
+        if not self.cwd:
+            return "(unknown)"
+        return os.path.basename(os.path.normpath(self.cwd)) or "/"
+
+
+def display_text(text: str, limit: int = 100) -> str:
+    """Keep each field on one line, without terminal control characters."""
+    text = "".join(c for c in text if c.isprintable() or c.isspace())
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def clean_user_text(text: str) -> str:
+    # Codex can record injected context as user-role response items.
+    text = CONTEXT_RE.sub("", text).strip()
+    if text.lower().startswith(
+        ("# agents.md instructions", "<environment_context>",
+         "<user_instructions>", "<turn_aborted>")
+    ):
+        return ""
+    return text
+
+
+def text_content(content: object) -> str:
+    if isinstance(content, str):
+        return clean_user_text(content)
+    if isinstance(content, list):
+        return "\n".join(
+            clean_user_text(part["text"])
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") in ("input_text", "text")
+            and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def user_message(record: dict) -> str:
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    if record.get("type") == "event_msg" and payload.get("type") == "user_message":
+        text = text_content(payload.get("message", payload.get("content")))
+    elif (
+        record.get("type") == "response_item"
+        and payload.get("type") == "message"
+        and payload.get("role") == "user"
+    ):
+        text = text_content(payload.get("content"))
+    else:
+        return ""
+    return display_text(text)
+
+
+def is_user_session(meta: dict) -> bool:
+    if meta.get("parent_thread_id"):
+        return False
+    source = meta.get("source")
+    if isinstance(source, dict) and "subagent" in source:
+        return False
+    return meta.get("thread_source") not in ("guardian_review", "subagent")
+
+
+def session_metadata(payload: dict) -> dict:
+    """Accept both flat metadata and the payload.meta wrapper."""
+    nested = payload.get("meta")
+    merged = dict(payload)
+    merged.pop("meta", None)
+    if isinstance(nested, dict):
+        merged.update(nested)
+        # Keep useful outer metadata when nested fields are absent or null.
+        for key in ("parent_thread_id", "source", "thread_source", "git"):
+            if payload.get(key) and not nested.get(key):
+                merged[key] = payload[key]
+    return merged
+
+
+def session_uuid(meta: dict, path: Path) -> Optional[str]:
+    for key in ("session_id", "id"):
+        value = meta.get(key)
+        if isinstance(value, str) and UUID_RE.fullmatch(value):
+            return value.lower()
+    match = UUID_RE.search(path.name)
+    return match.group(0).lower() if match else None
+
+
+def parse_rollout(path: Path) -> Optional[Session]:
+    meta: dict = {}
+    metadata_seen = False
+    preview = ""
+    try:
+        mtime = path.stat().st_mtime
+        with path.open(encoding="utf-8", errors="replace") as rollout:
+            for line in rollout:
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, RecursionError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                payload = record.get("payload")
+                if record.get("type") == "session_meta" and isinstance(payload, dict):
+                    nested = payload.get("meta")
+                    # Check both layers before merging: a conflicting wrapper
+                    # must not hide a child's parent or subagent source.
+                    if not is_user_session(payload) or (
+                        isinstance(nested, dict) and not is_user_session(nested)
+                    ):
+                        return None
+                    meta.update(session_metadata(payload))
+                    metadata_seen = True
+                if not preview:
+                    preview = user_message(record)
+                # Known rollouts put metadata before conversation records.
+                # Avoid scanning a potentially huge tool-output tail.
+                if metadata_seen and preview:
+                    break
+    except OSError:
+        # A sync may remove a file or leave it temporarily unreadable.
+        return None
+
+    if not metadata_seen and not preview:
+        return None
+    session_id = session_uuid(meta, path)
+    if not session_id:
+        return None
+    cwd = meta.get("cwd")
+    if not isinstance(cwd, str) or not cwd.strip() or "\x00" in cwd:
+        cwd = None
+    git = meta.get("git")
+    branch = git.get("branch") if isinstance(git, dict) else meta.get("branch")
+    timestamp = meta.get("timestamp")
+    return Session(
+        session_id=session_id,
+        mtime=mtime,
+        cwd=cwd,
+        branch=branch if isinstance(branch, str) else "",
+        preview=preview,
+        rollout=path,
+        timestamp=timestamp if isinstance(timestamp, str) else None,
+    )
+
+
+def normalize_path(path: str) -> str:
+    """Resolve ~, relative components, and symlinks without requiring existence."""
+    return os.path.realpath(os.path.expanduser(path))
+
+
+def load_sessions(directory: Path, cwd: Optional[str] = None) -> list[Session]:
+    sessions: dict[str, Session] = {}
+    for path in directory.rglob("rollout-*.jsonl"):
+        session = parse_rollout(path)
+        if session is None:
+            continue
+        previous = sessions.get(session.session_id)
+        if previous is None or session.mtime > previous.mtime:
+            sessions[session.session_id] = session
+    result = sorted(sessions.values(), key=lambda session: session.mtime, reverse=True)
+    if cwd is not None:
+        normalized = normalize_path(cwd)
+        result = [
+            session for session in result
+            if session.cwd is not None and normalize_path(session.cwd) == normalized
+        ]
+    return result
+
+
+def format_session(session: Session) -> str:
+    updated = datetime.fromtimestamp(session.mtime).strftime("%Y-%m-%d %H:%M")
+    project = display_text(session.project, 20)
+    branch = display_text(session.branch, 16) or "-"
+    preview = session.preview or "(no user message)"
+    return f"{updated}  {project:<20}  {branch:<16}  {preview}"
+
+
+def choose_with_fzf(
+    sessions: list[Session], query: str = "", executable: str = "fzf"
+) -> Optional[Session]:
+    rows = "\n".join(
+        f"{session.session_id}\t{format_session(session)}" for session in sessions
+    )
+    env = os.environ.copy()
+    # Personal defaults such as --print-query can change the result format.
+    env.pop("FZF_DEFAULT_OPTS", None)
+    env.pop("FZF_DEFAULT_OPTS_FILE", None)
+    result = subprocess.run(
+        [executable, "--reverse", "--border", "--height=70%", "--no-multi",
+         "--delimiter=\t", "--with-nth=2..",
+         "--header=" + HEADER, "--query", query],
+        input=rows + "\n",
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+        check=False,
+    )
+    if result.returncode in (1, 130):
+        return None
+    if result.returncode != 0:
+        raise RuntimeError(f"fzf failed (exit status {result.returncode}).")
+    selected_id = result.stdout.strip().split("\t", 1)[0]
+    selected = next((s for s in sessions if s.session_id == selected_id), None)
+    if selected is None:
+        raise RuntimeError("fzf returned an unrecognized selection.")
+    return selected
+
+
+def choose_basic(sessions: list[Session], query: str = "") -> Optional[Session]:
+    words = query.casefold().split()
+    matches = [
+        session for session in sessions
+        if all(word in format_session(session).casefold() for word in words)
+    ]
+    if not matches:
+        print("cresume: no sessions match the query.", file=sys.stderr)
+        return None
+    visible = matches[:40]
+    print("    " + HEADER)
+    for number, session in enumerate(visible, 1):
+        print(f"{number:>2}. {format_session(session)}")
+    if len(matches) > 40:
+        print(f"Showing newest 40 of {len(matches)} matches; install fzf to browse all.")
+    while True:
+        try:
+            answer = input("Session number (Enter or q to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if answer.lower() in ("", "q", "quit", "\x1b"):
+            return None
+        try:
+            number = int(answer)
+        except ValueError:
+            number = 0
+        if 1 <= number <= len(visible):
+            return visible[number - 1]
+        print(f"Enter a number from 1 to {len(visible)}, or press Enter to cancel.")
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Pick a local or synced Codex session and resume it directly."
+    )
+    parser.add_argument(
+        "--cwd", action="store_true",
+        help="show only sessions recorded in the current directory (normalized)",
+    )
+    parser.add_argument(
+        "query", nargs="*", metavar="QUERY",
+        help="initial fzf query; simple text filter in the numbered menu",
+    )
+    args = parser.parse_args(argv)
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    directory = codex_home / "sessions"
+    try:
+        if not directory.is_dir():
+            print(f"cresume: sessions directory not found: {directory}", file=sys.stderr)
+            return 1
+        sessions = load_sessions(directory, os.getcwd() if args.cwd else None)
+        if not sessions:
+            message = (
+                "no sessions match the current directory."
+                if args.cwd else "no user sessions found."
+            )
+            print("cresume: " + message, file=sys.stderr)
+            return 1
+        if shutil.which("codex") is None:
+            print("cresume: codex is not in PATH; install the Codex CLI first.", file=sys.stderr)
+            return 1
+        query = " ".join(args.query)
+        fzf = shutil.which("fzf")
+        if fzf:
+            try:
+                selected = choose_with_fzf(sessions, query, fzf)
+            except FileNotFoundError:
+                selected = choose_basic(sessions, query)
+        else:
+            selected = choose_basic(sessions, query)
+        if selected is not None:
+            os.execvp("codex", ["codex", "resume", selected.session_id])
+        return 0
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 0
+    except (OSError, RuntimeError) as error:
+        print(f"cresume: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
