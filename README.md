@@ -1,5 +1,7 @@
 # cresume
 
+## Description
+
 `cresume` is a tiny cross-machine Codex session picker. Sync `~/.codex/sessions`
 between computers and resume any user session directly without relying on
 Codex's local session index.
@@ -10,7 +12,12 @@ Syncthing  → Codex session files
 cresume    → session discovery and resume
 ```
 
-## What it does
+Synchronized rollouts can exist locally before, or without, reliably appearing
+in Codex's normal local picker/index. `cresume` is a practical workaround: it
+reads the files directly and passes the selected UUID to `codex resume <UUID>`.
+This is not a claim that every Codex version has the same picker behavior.
+
+## Implementation details
 
 Codex stores rollout JSONL session files under `~/.codex/sessions`.
 `cresume` scans `rollout-*.jsonl` files recursively, reads session metadata and
@@ -27,7 +34,24 @@ are skipped.
 This is one Python script using only the standard library. It works with any
 mechanism that synchronizes session files; it does not integrate with Syncthing.
 
-## Requirements
+The parser supports `session_meta.payload` and `session_meta.payload.meta`,
+including outer git/source/parent metadata. It prefers `session_id`, then `id`,
+then a UUID in the filename. It recognizes `event_msg` / `user_message` and
+user-role `response_item` messages with text content, and skips known injected
+environment/instruction blocks. Metadata is expected near the start of the
+rollout; reading stops once metadata and a real user preview are found.
+The rollout format is an implementation detail, so future changes may require
+small parser updates. Direct resume cannot recover a corrupt or incompatible
+rollout. Archived sessions are outside v0.1's scope.
+
+`cresume` operates entirely locally and reads session files without modifying
+them. It does not transmit data, read `auth.json`, or access Codex's SQLite
+databases. After selection, the normal Codex CLI takes over and may use the
+network as usual.
+
+## Setup
+
+Requirements:
 
 - Linux
 - Python 3.8 or newer
@@ -35,7 +59,7 @@ mechanism that synchronizes session files; it does not integrate with Syncthing.
 - Optional: `fzf` for a searchable picker
 - Recommended for cross-machine use: Syncthing
 
-## Installation
+Install from GitHub:
 
 ```bash
 git clone https://github.com/mdel2424/cresume.git
@@ -62,8 +86,6 @@ chmod +x "$HOME/.local/bin/cresume"
 No sudo, pip, or package installation is needed. The installer does not change
 your shell configuration or configure Syncthing.
 
-## Syncthing setup
-
 Configure a Syncthing folder on each computer for **only**:
 
 ```text
@@ -73,6 +95,9 @@ Configure a Syncthing folder on each computer for **only**:
 Use `$CODEX_HOME/sessions` instead if you have customized Codex's home directory.
 Wait for synchronization to finish before resuming, and exit Codex on one
 computer before continuing the same session on another.
+
+Rollouts contain conversation content and can contain sensitive project
+information. Sync them only between trusted devices.
 
 **Do not synchronize the entire `~/.codex` directory.** Authentication and
 machine-local state should remain local. Depending on your Codex version,
@@ -120,11 +145,10 @@ Codex handles resuming and any working-directory prompt. Use matching project
 paths on both machines where practical, or choose the appropriate local
 directory when Codex asks.
 
-When prompted, set codex behaviour to automatically switch to the working directory.
+When prompted, set Codex to switch automatically to the session's working
+directory.
 
-## Workflow
-
-On Computer A:
+To continue a session on another computer, start on Computer A:
 
 ```bash
 cd ~/code/project
@@ -142,30 +166,3 @@ cresume
 ```
 
 Select the session and continue working.
-
-## Why not just `codex resume`?
-
-Synchronized rollouts can exist locally before, or without, reliably appearing
-in Codex's normal local picker/index. `cresume` is a practical workaround: it
-reads the files directly and passes the selected UUID to `codex resume <UUID>`.
-This is not a claim that every Codex version has the same picker behavior, or
-that direct resume can recover a corrupt or incompatible rollout.
-
-## Privacy and format compatibility
-
-Rollouts contain conversation content and can contain sensitive project
-information. Sync them only between trusted devices.
-
-`cresume` operates entirely locally and reads session files without modifying
-them. It does not transmit data, read `auth.json`, or access Codex's SQLite
-databases. After selection, the normal Codex CLI takes over and may use the
-network as usual.
-
-The parser supports `session_meta.payload` and `session_meta.payload.meta`,
-including outer git/source/parent metadata. It prefers `session_id`, then `id`,
-then a UUID in the filename. It recognizes `event_msg` / `user_message` and
-user-role `response_item` messages with text content, and skips known injected
-environment/instruction blocks. Metadata is expected near the start of the
-rollout; reading stops once metadata and a real user preview are found.
-The rollout format is an implementation detail, so future changes may require
-small parser updates. Archived sessions are outside v0.1's scope.
